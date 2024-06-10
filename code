@@ -1,0 +1,155 @@
+#code
+1. Reading Messages from SQS Queue
+We'll use the AWS SDK for Python (Boto3) to interact with the SQS queue. The messages will be fetched from the localstack instance running SQS.
+
+2. Data Transformation and Masking PII
+For masking PII data (device_id and ip), we can use a hash function like SHA-256. This way, the same input will always result in the same hash, making it easy to identify duplicates.
+
+3. Writing to PostgreSQL Database
+We will use the psycopg2 library to connect and write to the PostgreSQL database. The data will be transformed into a format suitable for the user_logins table.
+
+4. Running the Application
+We will use Docker to containerize the application. The application will be run from a Python script that will be executed in the Docker container.
+
+Implementation Steps
+Setup Docker Environment
+Custom localstack image with SQS preloaded with JSON data.
+Custom PostgreSQL image with the user_logins table precreated.
+Python Application
+Read messages from SQS queue.
+Flatten JSON data and mask PII.
+Insert data into PostgreSQL.
+Docker Compose Setup
+We'll create a docker-compose.yml file to manage the services.
+
+Python Application Code
+The Python application will be structured as follows:
+
+main.py: Main script to read from SQS, transform data, and write to PostgreSQL.
+requirements.txt: List of Python dependencies.
+Here's a high-level view of the implementation:
+
+docker-compose.yml
+version: '3'
+services:
+  localstack:
+    image: localstack/localstack
+    environment:
+      - SERVICES=sqs
+      - DEBUG=1
+    ports:
+      - "4566:4566"
+      - "4571:4571"
+    volumes:
+      - "./init-scripts:/docker-entrypoint-initaws.d"
+  
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: logins_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - "./db-data:/var/lib/postgresql/data"
+      - "./init-scripts:/docker-entrypoint-initdb.d"
+  
+  app:
+    build: .
+    depends_on:
+      - localstack
+      - postgres
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - DATABASE_URL=postgresql://user:password@postgres:5432/logins_db
+    volumes:
+      - "./app:/app"
+    command: python /app/main.py
+
+
+init-scripts/create-queue.sh
+#!/bin/bash
+awslocal sqs create-queue --queue-name user-logins-queue
+awslocal sqs send-message-batch --queue-url http://localhost:4566/000000000000/user-logins-queue --entries file://messages.json
+
+
+init-scripts/init-db.sql
+CREATE TABLE IF NOT EXISTS user_logins(
+  user_id varchar(128),
+  device_type varchar(32),
+  masked_ip varchar(256),
+  masked_device_id varchar(256),
+  locale varchar(32),
+  app_version integer,
+  create_date date
+);
+
+
+app/requirements.txt
+boto3
+psycopg2-binary
+
+
+app/main.py
+import os
+import hashlib
+import json
+import boto3
+import psycopg2
+from datetime import datetime
+
+def mask_value(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+def process_message(message):
+    data = json.loads(message['Body'])
+    flattened_data = {
+        'user_id': data['user_id'],
+        'device_type': data['device']['type'],
+        'masked_ip': mask_value(data['ip']),
+        'masked_device_id': mask_value(data['device']['id']),
+        'locale': data['locale'],
+        'app_version': int(data['app_version'].split('.')[0]),  # assuming version is like "1.2.3"
+        'create_date': datetime.strptime(data['create_date'], '%Y-%m-%d').date()
+    }
+    return flattened_data
+
+def main():
+    # SQS setup
+    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])
+    queue_url = sqs.get_queue_url(QueueName='user-logins-queue')['QueueUrl']
+
+    # Postgres setup
+    conn = psycopg2.connect(os.environ['DATABASE_URL'])
+    cursor = conn.cursor()
+
+    while True:
+        messages = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20)
+        if 'Messages' not in messages:
+            break
+
+        for message in messages['Messages']:
+            data = process_message(message)
+            cursor.execute(
+                """
+                INSERT INTO user_logins (user_id, device_type, masked_ip, masked_device_id, locale, app_version, create_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (data['user_id'], data['device_type'], data['masked_ip'], data['masked_device_id'], data['locale'], data['app_version'], data['create_date'])
+            )
+            conn.commit()
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=message['ReceiptHandle'])
+
+    cursor.close()
+    conn.close()
+
+if __name__ == "__main__":
+    main()
+
+
+Running the Application
+Build and Run Docker Containers
+docker-compose up --build
+
+This will start the localstack and PostgreSQL containers, initialize the SQS queue and PostgreSQL database, and then run the Python application to process the messages.
