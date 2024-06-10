@@ -1,0 +1,36 @@
+version: '3'
+services:
+  localstack:
+    image: localstack/localstack
+    environment:
+      - SERVICES=sqs
+      - DEBUG=1
+    ports:
+      - "4566:4566"
+      - "4571:4571"
+    volumes:
+      - "./init-scripts:/docker-entrypoint-initaws.d"
+  
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: logins_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - "./db-data:/var/lib/postgresql/data"
+      - "./init-scripts:/docker-entrypoint-initdb.d"
+  
+  app:
+    build: .
+    depends_on:
+      - localstack
+      - postgres
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - DATABASE_URL=postgresql://user:password@postgres:5432/logins_db
+    volumes:
+      - "./app:/app"
+    command: python /app/main.py
